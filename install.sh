@@ -1,1525 +1,618 @@
-$()$(
-  bash
-  #!/usr/bin/env bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-  set -Eeuo pipefail
+# ============================================================
+# Arch Linux Installer
+# UEFI + LUKS2 + Btrfs + systemd/sd-encrypt + GRUB
+# ============================================================
 
-  # ============================================================
-  # Arch Linux Installation Script
-  #
-  # Features:
-  #   - UEFI only
-  #   - LUKS2 encrypted root
-  #   - Btrfs
-  #   - Btrfs subvolumes:
-  #       @
-  #       @home
-  #       @swap
-  #   - Optional Btrfs swapfile
-  #   - Optional hibernation
-  #   - systemd-based initramfs + sd-encrypt
-  #   - GRUB UEFI
-  #   - Intel / AMD microcode auto detection
-  #   - NetworkManager
-  #   - Optional Windows dual boot / os-prober
-  #   - China / International mirrors
-  #
-  # IMPORTANT:
-  #   The selected ROOT partition WILL be erased.
-  #   The EFI partition is only formatted if explicitly confirmed.
-  #
-  #   If you reuse an existing Windows EFI System Partition,
-  #   DO NOT format it.
-  # ============================================================
-
-  # ------------------------------------------------------------
-  # Colors
-  # ------------------------------------------------------------
-
-  RED='\033[0;31m'
-  GREEN='\033[0;32m'
-  YELLOW='\033[1;33m'
-  BLUE='\033[0;34m'
-  BOLD='\033[1m'
-  NC='\033[0m'
-
-  # ------------------------------------------------------------
-  # Helper functions
-  # ------------------------------------------------------------
-
-  log() {
-    echo -e "${GREEN}[+]${NC} $*"
-  }
-
-  info() {
-    echo -e "${BLUE}[*]${NC} $*"
-  }
-
-  warn() {
-    echo -e "${YELLOW}[!]${NC} $*"
-  }
-
-  die() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
+# This is an interactive installer. Always use the real terminal for
+# input/output so a broken redirection or terminal state cannot hide input.
+if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    printf 'ERROR: /dev/tty is not available. Run this script from an interactive console.\n' >&2
     exit 1
-  }
+fi
+exec </dev/tty >/dev/tty 2>/dev/tty
+stty sane </dev/tty || true
+stty echo </dev/tty || true
 
-  confirm() {
-    local prompt="$1"
-    local reply
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-    read -rp "$prompt [y/N]: " reply
+log()  { printf '%b[+]%b %s\n' "$GREEN" "$NC" "$*"; }
+info() { printf '%b[*]%b %s\n' "$BLUE" "$NC" "$*"; }
+warn() { printf '%b[!]%b %s\n' "$YELLOW" "$NC" "$*"; }
+die()  { printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
-    [[ "$reply" =~ ^[Yy]$ ]]
-  }
+pause() {
+    local _dummy
+    IFS= read -r -p 'Press Enter to continue...' _dummy </dev/tty
+    printf '\n'
+}
 
-  pause() {
-    read -rp "Press Enter to continue..."
-  }
+read_text() {
+    local prompt="$1" default_value="${2-}" value
+    if [[ -n "$default_value" ]]; then
+        IFS= read -r -p "$prompt [$default_value]: " value </dev/tty
+        value="${value:-$default_value}"
+    else
+        IFS= read -r -p "$prompt: " value </dev/tty
+    fi
+    printf '%b[Selected]%b %s\n' "$BLUE" "$NC" "$value"
+    REPLY_VALUE="$value"
+}
 
-  command_exists() {
-    command -v "$1" >/dev/null 2>&1
-  }
+read_choice() {
+    local prompt="$1" allowed="$2" value option
+    local -a options=()
+    IFS='/' read -r -a options <<< "$allowed"
+    while true; do
+        IFS= read -r -p "$prompt [$allowed]: " value </dev/tty
+        printf '%b[Selected]%b %s\n' "$BLUE" "$NC" "${value:-<empty>}"
+        for option in "${options[@]}"; do
+            if [[ "$value" == "$option" ]]; then
+                REPLY_VALUE="$value"
+                return 0
+            fi
+        done
+        warn "Invalid choice. Allowed values: $allowed"
+    done
+}
 
-  # ------------------------------------------------------------
-  # Error handler
-  # ------------------------------------------------------------
+confirm() {
+    local prompt="$1" value
+    while true; do
+        IFS= read -r -p "$prompt [y/N]: " value </dev/tty
+        value="${value:-n}"
+        printf '%b[Selected]%b %s\n' "$BLUE" "$NC" "$value"
+        case "$value" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No)   return 1 ;;
+            *) warn 'Please enter y or n.' ;;
+        esac
+    done
+}
 
-  error_handler() {
-    local exit_code=$?
-    local line_no=$1
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
 
-    echo
-    echo -e "${RED}[ERROR]${NC} Installation failed."
-    echo -e "${RED}[ERROR]${NC} Line: ${line_no}"
-    echo -e "${RED}[ERROR]${NC} Exit code: ${exit_code}"
-    echo
-    echo "The installer has stopped to avoid making further changes."
-    echo
-    echo "Current mounts can be inspected with:"
-    echo
-    echo "  findmnt /mnt"
-    echo "  lsblk -f"
-    echo
-    echo "If necessary, clean up manually with:"
-    echo
-    echo "  swapoff /mnt/swap/swapfile 2>/dev/null || true"
-    echo "  umount -R /mnt 2>/dev/null || true"
-    echo "  cryptsetup close cryptroot 2>/dev/null || true"
-    echo
+cleanup_hint() {
+    printf '\nCleanup commands, if needed:\n'
+    printf '  swapoff /mnt/swap/swapfile 2>/dev/null || true\n'
+    printf '  umount -R /mnt 2>/dev/null || true\n'
+    printf '  cryptsetup close cryptroot 2>/dev/null || true\n\n'
+}
 
-    exit "$exit_code"
-  }
+on_error() {
+    local code=$? line="$1"
+    printf '\n%b[ERROR]%b Installer stopped at line %s (exit code %s).\n' "$RED" "$NC" "$line" "$code" >&2
+    cleanup_hint >&2
+    exit "$code"
+}
+trap 'on_error "$LINENO"' ERR
 
-  trap 'error_handler "$LINENO"' ERR
+# Detect common copy/paste contamination before doing anything destructive.
+SELF_PATH="$(readlink -f -- "$0")"
+if grep -nE '^[[:space:]]*(bash|install\.sh|```[[:alnum:]_-]*)[[:space:]]*$' "$SELF_PATH" >/tmp/arch-installer-contamination.$$ 2>/dev/null; then
+    printf '%b[ERROR]%b The script contains suspicious standalone lines that can create a nested shell or break execution:\n' "$RED" "$NC" >&2
+    cat /tmp/arch-installer-contamination.$$ >&2
+    rm -f /tmp/arch-installer-contamination.$$
+    die 'Remove the lines above, or replace the file with the clean installer.'
+fi
+rm -f /tmp/arch-installer-contamination.$$ 2>/dev/null || true
 
-  # ------------------------------------------------------------
-  # Basic environment checks
-  # ------------------------------------------------------------
+[[ $EUID -eq 0 ]] || die 'Run this installer as root.'
+[[ -r /etc/arch-release ]] || die 'This does not appear to be an Arch Linux environment.'
+[[ -d /sys/firmware/efi/efivars ]] || die 'The Arch ISO is not booted in UEFI mode. Reboot and choose the UEFI entry for the USB device.'
 
-  [[ $EUID -eq 0 ]] || die "This installer must be run as root."
+for cmd in pacman pacstrap arch-chroot cryptsetup btrfs lsblk findmnt mountpoint timedatectl ping; do
+    require_command "$cmd"
+done
 
-  [[ -r /etc/arch-release ]] ||
-    die "This does not appear to be an Arch Linux environment."
+if mountpoint -q /mnt; then
+    die '/mnt is already mounted. Run: umount -R /mnt'
+fi
+if [[ -e /dev/mapper/cryptroot ]]; then
+    die '/dev/mapper/cryptroot already exists. Run: cryptsetup close cryptroot'
+fi
 
-  [[ -d /sys/firmware/efi/efivars ]] || {
-    echo
-    die "The Arch ISO is not booted in UEFI mode.
-
-Reboot and select the UEFI entry for your installation media.
-
-For example:
-
-    UEFI: SanDisk USB
-
-Do NOT select:
-
-    SanDisk USB
-
-if that entry boots the device in Legacy BIOS / CSM mode."
-  }
-
-  command_exists pacstrap ||
-    die "pacstrap is not available. Boot from the official Arch Linux ISO."
-
-  command_exists arch-chroot ||
-    die "arch-chroot is not available."
-
-  command_exists cryptsetup ||
-    die "cryptsetup is not available."
-
-  command_exists btrfs ||
-    die "btrfs-progs is not available."
-
-  # ------------------------------------------------------------
-  # Make sure /mnt is clean
-  # ------------------------------------------------------------
-
-  if mountpoint -q /mnt; then
-    die "/mnt is already mounted.
-
-Unmount the existing installation first:
-
-    umount -R /mnt
-
-Then run this installer again."
-  fi
-
-  if [[ -e /dev/mapper/cryptroot ]]; then
-    die "/dev/mapper/cryptroot already exists.
-
-Close it first:
-
-    cryptsetup close cryptroot"
-  fi
-
-  # ------------------------------------------------------------
-  # Header
-  # ------------------------------------------------------------
-
-  clear
-
-  cat <<'EOF'
+clear
+cat <<'EOF'
 ============================================================
               Arch Linux Installer
 ============================================================
 
-Configuration:
-
   Boot mode       : UEFI
   Root encryption : LUKS2
   Filesystem      : Btrfs
-  Bootloader      : GRUB
   Initramfs       : systemd + sd-encrypt
+  Bootloader      : GRUB
   Networking      : NetworkManager
 
-Btrfs subvolumes:
+  Btrfs subvolumes:
+      @      -> /
+      @home  -> /home
+      @swap  -> /swap
 
-  @       -> /
-  @home   -> /home
-  @swap   -> /swap
-
-WARNING:
-
-  The selected ROOT partition WILL be erased.
-
-  If you already have Windows installed and reuse its EFI
-  System Partition, DO NOT format that EFI partition.
-
+WARNING: The selected ROOT partition will be erased.
+If reusing a Windows EFI System Partition, DO NOT format it.
 ============================================================
-
 EOF
 
-  pause
+info "Installer PID: $$ (parent shell PID: $PPID)"
+info 'Terminal input/output has been rebound to /dev/tty and echo is enabled.'
+pause
 
-  # ============================================================
-  # 1. NETWORK
-  # ============================================================
+# ============================================================
+# 1. NETWORK
+# ============================================================
+printf '\n=== Network configuration ===\n\n'
+printf '1) Wired network / already connected\n'
+printf '2) Wi-Fi using iwctl\n\n'
+read_choice 'Select network method' '1/2'
+NETWORK_TYPE="$REPLY_VALUE"
 
-  echo
-  echo "============================================================"
-  echo " Network configuration"
-  echo "============================================================"
-  echo
+case "$NETWORK_TYPE" in
+    1)
+        log 'Using existing network connection.'
+        ;;
+    2)
+        require_command iwctl
+        printf '\nUseful iwctl commands:\n\n'
+        printf '  device list\n'
+        printf '  station wlan0 scan\n'
+        printf '  station wlan0 get-networks\n'
+        printf '  station wlan0 connect "WiFi-Name"\n'
+        printf '  exit\n\n'
+        pause
+        iwctl
+        stty sane </dev/tty || true
+        stty echo </dev/tty || true
+        ;;
+esac
 
-  echo "1) Wired network / network already connected"
-  echo "2) Wi-Fi using iwctl"
-  echo
+log 'Testing network connectivity...'
+if ping -c 3 -W 3 archlinux.org >/dev/null 2>&1; then
+    log 'Internet connection is working.'
+elif ping -c 3 -W 3 1.1.1.1 >/dev/null 2>&1; then
+    die 'IP connectivity works, but DNS resolution failed.'
+else
+    die 'No Internet connection detected.'
+fi
 
-  read -rp "Select network method [1/2]: " NETWORK_TYPE
+# ============================================================
+# 2. CLOCK
+# ============================================================
+log 'Enabling NTP synchronization...'
+timedatectl set-ntp true
+sleep 2
+timedatectl status --no-pager || true
 
-  case "$NETWORK_TYPE" in
+# ============================================================
+# 3. MIRRORS
+# ============================================================
+printf '\n=== Package mirrors ===\n\n'
+printf '1) China mirrors (TUNA + USTC)\n'
+printf '2) International mirrors from the Arch ISO\n\n'
+read_choice 'Select mirror group' '1/2'
+MIRROR_TYPE="$REPLY_VALUE"
 
-  1)
-    info "Using existing network connection."
-    ;;
+MIRRORLIST=/etc/pacman.d/mirrorlist
+MIRROR_BACKUP=/etc/pacman.d/mirrorlist.arch-installer-backup
+cp -f "$MIRRORLIST" "$MIRROR_BACKUP"
 
-  2)
-    echo
-    info "Opening iwctl."
-    echo
-    echo "Useful commands:"
-    echo
-    echo "  device list"
-    echo "  station wlan0 scan"
-    echo "  station wlan0 get-networks"
-    echo "  station wlan0 connect \"WiFi-Name\""
-    echo "  exit"
-    echo
-
-    pause
-
-    iwctl
-    ;;
-
-  *)
-    die "Invalid network option."
-    ;;
-  esac
-
-  # ------------------------------------------------------------
-  # Test connectivity
-  # ------------------------------------------------------------
-
-  echo
-  log "Testing network connectivity..."
-
-  if ping -c 3 -W 3 archlinux.org >/dev/null 2>&1; then
-
-    log "Internet connection is working."
-
-  elif ping -c 3 -W 3 1.1.1.1 >/dev/null 2>&1; then
-
-    warn "IP connectivity works, but DNS resolution failed."
-    die "Check DNS configuration before continuing."
-
-  else
-
-    die "No Internet connection detected."
-
-  fi
-
-  # ============================================================
-  # 2. CLOCK
-  # ============================================================
-
-  echo
-  log "Enabling network time synchronization..."
-
-  timedatectl set-ntp true
-
-  sleep 2
-
-  timedatectl status --no-pager || true
-
-  # ============================================================
-  # 3. MIRROR SELECTION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Package mirrors"
-  echo "============================================================"
-  echo
-
-  echo "1) China mirrors"
-  echo "2) International mirrors"
-  echo
-
-  read -rp "Select mirror group [1/2]: " MIRROR_TYPE
-
-  MIRRORLIST="/etc/pacman.d/mirrorlist"
-  MIRRORLIST_BACKUP="/etc/pacman.d/mirrorlist.arch-installer-backup"
-
-  cp -f "$MIRRORLIST" "$MIRRORLIST_BACKUP"
-
-  case "$MIRROR_TYPE" in
-
-  1)
-
-    log "Using China mirrors."
-
-    cat >"$MIRRORLIST" <<'EOF'
+if [[ "$MIRROR_TYPE" == 1 ]]; then
+    cat > "$MIRRORLIST" <<'EOF'
 Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch
 Server = https://mirrors.ustc.edu.cn/archlinux/$repo/os/$arch
 EOF
+    log 'China mirrors selected.'
+else
+    log 'International mirror list selected.'
+fi
 
-    ;;
+log 'Refreshing package databases and keyring...'
+pacman -Sy --needed --noconfirm archlinux-keyring
 
-  2)
+# ============================================================
+# 4. DISK / PARTITIONS
+# ============================================================
+printf '\n=== Disk configuration ===\n\n'
+lsblk -o NAME,PATH,SIZE,TYPE,FSTYPE,FSVER,PARTTYPENAME,LABEL,MOUNTPOINTS,MODEL
+printf '\nRecommended layout:\n'
+printf '  EFI  : 1-2 GiB, EFI System Partition\n'
+printf '  ROOT : remaining space, Linux filesystem\n\n'
+warn 'Reuse an existing Windows ESP if appropriate, but do not format it.'
 
-    log "Using the mirror list provided by the Arch ISO."
-
-    ;;
-
-  *)
-
-    die "Invalid mirror option."
-
-    ;;
-  esac
-
-  # ------------------------------------------------------------
-  # Keyring
-  # ------------------------------------------------------------
-
-  echo
-  log "Synchronizing package databases and updating keyring..."
-
-  pacman -Sy --needed --noconfirm archlinux-keyring
-
-  # ============================================================
-  # 4. DISK SELECTION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Disk configuration"
-  echo "============================================================"
-  echo
-
-  lsblk \
-    -o NAME,PATH,SIZE,TYPE,FSTYPE,FSVER,PARTTYPENAME,LABEL,MOUNTPOINTS,MODEL
-
-  echo
-  echo "Recommended layout:"
-  echo
-  echo "  EFI  : 1-2 GiB, EFI System Partition"
-  echo "  ROOT : remaining space, Linux filesystem"
-  echo
-  echo "The ROOT partition will contain LUKS2 + Btrfs."
-  echo
-
-  warn "Existing Windows users should normally reuse the existing EFI partition."
-  warn "Do NOT format an existing Windows EFI partition."
-
-  # ------------------------------------------------------------
-  # Optional cfdisk
-  # ------------------------------------------------------------
-
-  echo
-
-  if confirm "Run cfdisk now?"; then
-
-    echo
-
-    read -rp \
-      "Enter target disk (example: /dev/nvme0n1 or /dev/sda): " \
-      INSTALL_DISK
-
-    [[ -b "$INSTALL_DISK" ]] ||
-      die "$INSTALL_DISK is not a valid block device."
-
-    echo
-    warn "You are about to modify:"
-    echo
-    echo "  $INSTALL_DISK"
-    echo
-
+if confirm 'Run cfdisk now?'; then
+    read_text 'Target disk (example: /dev/nvme0n1 or /dev/sda)'
+    INSTALL_DISK="$REPLY_VALUE"
+    [[ -b "$INSTALL_DISK" ]] || die "$INSTALL_DISK is not a valid block device."
+    warn "cfdisk will open for $INSTALL_DISK"
     pause
-
     cfdisk "$INSTALL_DISK"
-
     partprobe "$INSTALL_DISK" || true
     udevadm settle || true
-
     sleep 2
+fi
 
-    echo
-    lsblk \
-      -o NAME,PATH,SIZE,TYPE,FSTYPE,PARTTYPENAME,MOUNTPOINTS \
-      "$INSTALL_DISK"
-  fi
+printf '\nCurrent partitions:\n\n'
+lsblk -f
+printf '\n'
+read_text 'EFI partition (example: /dev/nvme0n1p1)'
+EFI_PART="$REPLY_VALUE"
+read_text 'Arch ROOT partition (example: /dev/nvme0n1p2)'
+ROOT_PART="$REPLY_VALUE"
 
-  # ------------------------------------------------------------
-  # Select partitions
-  # ------------------------------------------------------------
+[[ -b "$EFI_PART" ]] || die "EFI partition does not exist: $EFI_PART"
+[[ -b "$ROOT_PART" ]] || die "ROOT partition does not exist: $ROOT_PART"
+[[ "$EFI_PART" != "$ROOT_PART" ]] || die 'EFI and ROOT cannot be the same partition.'
+[[ "$(lsblk -ndo TYPE "$ROOT_PART")" == part ]] || die 'ROOT must be a partition.'
 
-  echo
-  info "Current partitions:"
-  echo
+if findmnt -rn -S "$ROOT_PART" >/dev/null 2>&1; then
+    die 'The selected ROOT partition is already mounted.'
+fi
 
-  lsblk -f
+printf '\n%bDESTRUCTIVE OPERATION WARNING%b\n' "$RED$BOLD" "$NC"
+printf '  EFI partition : %s\n' "$EFI_PART"
+printf '  ROOT to erase : %s\n\n' "$ROOT_PART"
+read_text 'Type ERASE-ROOT to continue'
+[[ "$REPLY_VALUE" == 'ERASE-ROOT' ]] || die 'Installation cancelled.'
 
-  echo
+# ============================================================
+# 5. EFI
+# ============================================================
+printf '\n=== EFI System Partition ===\n\n'
+EFI_FS="$(lsblk -ndo FSTYPE "$EFI_PART" || true)"
+printf 'Selected EFI partition: %s\n' "$EFI_PART"
+printf 'Current filesystem    : %s\n\n' "${EFI_FS:-unknown}"
 
-  read -rp \
-    "Enter EFI partition (example: /dev/nvme0n1p1): " \
-    EFI_PART
-
-  read -rp \
-    "Enter Arch ROOT partition (example: /dev/nvme0n1p2): " \
-    ROOT_PART
-
-  # ------------------------------------------------------------
-  # Validate selected partitions
-  # ------------------------------------------------------------
-
-  [[ -b "$EFI_PART" ]] ||
-    die "EFI partition does not exist: $EFI_PART"
-
-  [[ -b "$ROOT_PART" ]] ||
-    die "ROOT partition does not exist: $ROOT_PART"
-
-  [[ "$EFI_PART" != "$ROOT_PART" ]] ||
-    die "EFI and ROOT cannot be the same partition."
-
-  if findmnt -rn -S "$ROOT_PART" >/dev/null 2>&1; then
-
-    die "The selected ROOT partition is already mounted.
-
-Unmount it before running the installer."
-
-  fi
-
-  ROOT_TYPE=$(lsblk -ndo TYPE "$ROOT_PART")
-
-  [[ "$ROOT_TYPE" == "part" ]] ||
-    die "$ROOT_PART is not a partition."
-
-  # ------------------------------------------------------------
-  # Display destructive operation summary
-  # ------------------------------------------------------------
-
-  echo
-  echo "============================================================"
-  echo -e "${RED}${BOLD} DESTRUCTIVE OPERATION WARNING${NC}"
-  echo "============================================================"
-  echo
-  echo "EFI partition:"
-  echo
-  echo "  $EFI_PART"
-  echo
-  echo "ROOT partition to ERASE:"
-  echo
-  echo "  $ROOT_PART"
-  echo
-  echo "Everything currently stored on the ROOT partition will be lost."
-  echo
-
-  read -rp "Type ERASE-ROOT to continue: " ROOT_CONFIRM
-
-  [[ "$ROOT_CONFIRM" == "ERASE-ROOT" ]] ||
-    die "Installation cancelled."
-
-  # ============================================================
-  # 5. EFI PARTITION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " EFI System Partition"
-  echo "============================================================"
-  echo
-
-  EFI_FS=$(lsblk -ndo FSTYPE "$EFI_PART" || true)
-
-  echo "EFI partition:"
-  echo
-  echo "  $EFI_PART"
-  echo
-  echo "Current filesystem:"
-  echo
-  echo "  ${EFI_FS:-unknown}"
-  echo
-
-  if confirm "Format the EFI partition as FAT32?"; then
-
-    echo
-    warn "DO NOT do this when reusing the Windows EFI partition."
-    echo
-
-    read -rp "Type FORMAT-EFI to continue: " EFI_CONFIRM
-
-    [[ "$EFI_CONFIRM" == "FORMAT-EFI" ]] ||
-      die "EFI formatting cancelled."
-
+if confirm 'Format the EFI partition as FAT32?'; then
+    warn 'Do NOT format an existing Windows EFI partition unless you intentionally want to erase it.'
+    read_text 'Type FORMAT-EFI to confirm'
+    [[ "$REPLY_VALUE" == 'FORMAT-EFI' ]] || die 'EFI formatting cancelled.'
     umount "$EFI_PART" 2>/dev/null || true
-
-    log "Formatting EFI partition..."
-
     mkfs.fat -F32 "$EFI_PART"
-
-  else
-
-    info "Keeping the existing EFI filesystem."
-
-    EFI_FS=$(lsblk -ndo FSTYPE "$EFI_PART" || true)
-
-    if [[ "$EFI_FS" != "vfat" ]]; then
-
-      echo
-      warn "The selected EFI partition does not appear to contain FAT32/vfat."
-      warn "UEFI System Partitions normally use FAT32."
-      echo
-
-      confirm "Continue anyway?" ||
-        die "Installation cancelled."
-
+else
+    EFI_FS="$(lsblk -ndo FSTYPE "$EFI_PART" || true)"
+    if [[ "$EFI_FS" != vfat ]]; then
+        warn "Selected EFI filesystem is '${EFI_FS:-unknown}', not vfat/FAT32."
+        confirm 'Continue anyway?' || die 'Installation cancelled.'
     fi
-  fi
+fi
 
-  # ============================================================
-  # 6. LUKS2
-  # ============================================================
+# ============================================================
+# 6. LUKS2 + BTRFS
+# ============================================================
+printf '\n=== LUKS2 encryption ===\n\n'
+info 'You will be prompted for the LUKS password twice.'
+cryptsetup luksFormat --type luks2 --verify-passphrase "$ROOT_PART"
+cryptsetup open "$ROOT_PART" cryptroot
+[[ -b /dev/mapper/cryptroot ]] || die 'Failed to open cryptroot.'
 
-  echo
-  echo "============================================================"
-  echo " LUKS2 encryption"
-  echo "============================================================"
-  echo
+log 'Creating Btrfs filesystem...'
+mkfs.btrfs -f -L ArchLinux /dev/mapper/cryptroot
+mount /dev/mapper/cryptroot /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@swap
+umount /mnt
 
-  log "Creating LUKS2 container on $ROOT_PART..."
+BTRFS_OPTS='noatime,compress=zstd:3,discard=async'
+mount -o "${BTRFS_OPTS},subvol=@" /dev/mapper/cryptroot /mnt
+mkdir -p /mnt/{home,boot,swap}
+mount -o "${BTRFS_OPTS},subvol=@home" /dev/mapper/cryptroot /mnt/home
+mount -o 'noatime,subvol=@swap' /dev/mapper/cryptroot /mnt/swap
+mount "$EFI_PART" /mnt/boot
 
-  echo
-  echo "You will now be asked to create the disk encryption password."
-  echo
+# ============================================================
+# 7. SWAP / HIBERNATION
+# ============================================================
+printf '\n=== Swap and hibernation ===\n\n'
+MEM_KIB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+RAM_GIB="$(awk -v kib="$MEM_KIB" 'BEGIN {printf "%d", (kib + 1048575) / 1048576}')"
+printf 'Detected RAM: approximately %s GiB\n\n' "$RAM_GIB"
 
-  cryptsetup luksFormat \
-    --type luks2 \
-    --verify-passphrase \
-    "$ROOT_PART"
-
-  echo
-  log "Opening encrypted root..."
-
-  cryptsetup open \
-    "$ROOT_PART" \
-    cryptroot
-
-  [[ -b /dev/mapper/cryptroot ]] ||
-    die "Failed to open the encrypted root volume."
-
-  # ============================================================
-  # 7. BTRFS
-  # ============================================================
-
-  echo
-  log "Creating Btrfs filesystem..."
-
-  mkfs.btrfs \
-    -f \
-    -L ArchLinux \
-    /dev/mapper/cryptroot
-
-  echo
-  log "Creating Btrfs subvolumes..."
-
-  mount /dev/mapper/cryptroot /mnt
-
-  btrfs subvolume create /mnt/@
-  btrfs subvolume create /mnt/@home
-  btrfs subvolume create /mnt/@swap
-
-  umount /mnt
-
-  # ============================================================
-  # 8. MOUNT BTRFS
-  # ============================================================
-
-  BTRFS_OPTS="noatime,compress=zstd:3,discard=async"
-
-  log "Mounting Btrfs root subvolume..."
-
-  mount \
-    -o "${BTRFS_OPTS},subvol=@" \
-    /dev/mapper/cryptroot \
-    /mnt
-
-  mkdir -p \
-    /mnt/home \
-    /mnt/boot \
-    /mnt/swap
-
-  log "Mounting Btrfs home subvolume..."
-
-  mount \
-    -o "${BTRFS_OPTS},subvol=@home" \
-    /dev/mapper/cryptroot \
-    /mnt/home
-
-  log "Mounting Btrfs swap subvolume..."
-
-  mount \
-    -o "noatime,subvol=@swap" \
-    /dev/mapper/cryptroot \
-    /mnt/swap
-
-  log "Mounting EFI partition..."
-
-  mount "$EFI_PART" /mnt/boot
-
-  # ============================================================
-  # 9. SWAP / HIBERNATION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Swap and hibernation"
-  echo "============================================================"
-  echo
-
-  MEM_KIB=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
-
-  RAM_GIB=$(
-    awk -v kib="$MEM_KIB" \
-      'BEGIN {printf "%d", (kib + 1048575) / 1048576}'
-  )
-
-  echo "Detected RAM:"
-  echo
-  echo "  approximately ${RAM_GIB} GiB"
-  echo
-
-  HIBERNATION="no"
-
-  if confirm "Configure hibernation support?"; then
-    HIBERNATION="yes"
-  fi
-
-  if [[ "$HIBERNATION" == "yes" ]]; then
-
+HIBERNATION=no
+if confirm 'Configure hibernation support?'; then
+    HIBERNATION=yes
     DEFAULT_SWAP="$RAM_GIB"
-
-    echo
-    info "For hibernation, a swapfile large enough for the hibernation"
-    info "image is required."
-    echo
-    echo "Suggested starting value: ${DEFAULT_SWAP} GiB"
-
-  else
-
+else
     DEFAULT_SWAP=8
+fi
 
-  fi
+read_text 'Swap size in GiB (0 disables swap)' "$DEFAULT_SWAP"
+SWAP_SIZE="$REPLY_VALUE"
+[[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] || die 'Swap size must be an integer.'
+if [[ "$HIBERNATION" == yes && "$SWAP_SIZE" -eq 0 ]]; then
+    die 'Hibernation requires swap.'
+fi
 
-  echo
-
-  read -rp \
-    "Swap size in GiB [${DEFAULT_SWAP}, 0 disables swap]: " \
-    SWAP_SIZE
-
-  SWAP_SIZE=${SWAP_SIZE:-$DEFAULT_SWAP}
-
-  [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] ||
-    die "Swap size must be an integer."
-
-  if [[ "$HIBERNATION" == "yes" && "$SWAP_SIZE" -eq 0 ]]; then
-
-    die "Hibernation requires swap."
-
-  fi
-
-  SWAP_OFFSET=""
-
-  if ((SWAP_SIZE > 0)); then
-
-    echo
+SWAP_OFFSET=''
+if (( SWAP_SIZE > 0 )); then
     log "Creating ${SWAP_SIZE} GiB Btrfs swapfile..."
-
-    btrfs filesystem mkswapfile \
-      --size "${SWAP_SIZE}G" \
-      --uuid clear \
-      /mnt/swap/swapfile
-
+    btrfs filesystem mkswapfile --size "${SWAP_SIZE}G" /mnt/swap/swapfile
     swapon /mnt/swap/swapfile
+    if [[ "$HIBERNATION" == yes ]]; then
+        SWAP_OFFSET="$(btrfs inspect-internal map-swapfile -r /mnt/swap/swapfile)"
+        [[ "$SWAP_OFFSET" =~ ^[0-9]+$ ]] || die 'Could not calculate Btrfs resume offset.'
+        log "Resume offset: $SWAP_OFFSET"
+    fi
+fi
 
-    echo
-    log "Swap activated."
-
+printf '\nMounted filesystems:\n'
+findmnt /mnt
+if (( SWAP_SIZE > 0 )); then
+    printf '\nActive swap:\n'
     swapon --show
+fi
+pause
 
-    if [[ "$HIBERNATION" == "yes" ]]; then
+# ============================================================
+# 8. CPU MICROCODE
+# ============================================================
+CPU_VENDOR="$(awk -F ': ' '/vendor_id/ {print $2; exit}' /proc/cpuinfo)"
+MICROCODE=''
+case "$CPU_VENDOR" in
+    GenuineIntel) MICROCODE='intel-ucode' ;;
+    AuthenticAMD) MICROCODE='amd-ucode' ;;
+    *) warn 'Intel/AMD CPU vendor was not detected; no microcode package will be added automatically.' ;;
+esac
+[[ -n "$MICROCODE" ]] && log "Microcode package: $MICROCODE"
 
-      echo
-      log "Calculating Btrfs swapfile resume offset..."
+# ============================================================
+# 9. INSTALL PACKAGES
+# ============================================================
+printf '\n=== Installing Arch Linux ===\n\n'
+PACKAGES=(
+    base base-devel linux linux-headers linux-firmware
+    btrfs-progs cryptsetup
+    grub efibootmgr os-prober fuse3 ntfs-3g
+    networkmanager iwd
+    sudo vim neovim fish fastfetch
+    man-db man-pages
+)
+[[ -n "$MICROCODE" ]] && PACKAGES+=("$MICROCODE")
+pacstrap -K /mnt "${PACKAGES[@]}"
 
-      SWAP_OFFSET=$(
-        btrfs inspect-internal map-swapfile \
-          -r \
-          /mnt/swap/swapfile
-      )
+# ============================================================
+# 10. FSTAB
+# ============================================================
+log 'Generating fstab...'
+genfstab -U /mnt > /mnt/etc/fstab
+if (( SWAP_SIZE > 0 )) && ! grep -q '/swap/swapfile' /mnt/etc/fstab; then
+    printf '/swap/swapfile none swap defaults 0 0\n' >> /mnt/etc/fstab
+fi
+printf '\nGenerated /etc/fstab:\n\n'
+cat /mnt/etc/fstab
 
-      [[ "$SWAP_OFFSET" =~ ^[0-9]+$ ]] ||
-        die "Failed to calculate Btrfs swapfile resume offset."
-
-      log "Resume offset: $SWAP_OFFSET"
-
+# ============================================================
+# 11. WINDOWS ESP (OPTIONAL)
+# ============================================================
+printf '\n=== Windows dual boot ===\n\n'
+WINDOWS_EFI_PART=''
+if [[ -f /mnt/boot/EFI/Microsoft/Boot/bootmgfw.efi ]]; then
+    log 'Windows Boot Manager found on the selected ESP.'
+else
+    info 'Windows Boot Manager was not found on the selected ESP.'
+    if confirm 'Mount a separate Windows EFI partition read-only for os-prober?'; then
+        lsblk -f
+        read_text 'Windows EFI partition'
+        WINDOWS_EFI_PART="$REPLY_VALUE"
+        [[ -b "$WINDOWS_EFI_PART" ]] || die 'Invalid Windows EFI partition.'
+        [[ "$WINDOWS_EFI_PART" != "$ROOT_PART" ]] || die 'Windows EFI cannot be the Arch ROOT partition.'
+        mkdir -p /mnt/windows-efi
+        mount -o ro "$WINDOWS_EFI_PART" /mnt/windows-efi
     fi
-
-  fi
-
-  # ============================================================
-  # 10. VERIFY MOUNTS
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Filesystem verification"
-  echo "============================================================"
-  echo
-
-  findmnt /mnt
-
-  echo
-
-  if ((SWAP_SIZE > 0)); then
-    swapon --show
-  fi
-
-  echo
-
-  btrfs filesystem usage /mnt || true
-
-  echo
-
-  pause
-
-  # ============================================================
-  # 11. CPU MICROCODE
-  # ============================================================
-
-  CPU_VENDOR=$(
-    awk -F ': ' '/vendor_id/ {print $2; exit}' /proc/cpuinfo
-  )
-
-  MICROCODE_PACKAGE=""
-
-  case "$CPU_VENDOR" in
-
-  GenuineIntel)
-    MICROCODE_PACKAGE="intel-ucode"
-    ;;
-
-  AuthenticAMD)
-    MICROCODE_PACKAGE="amd-ucode"
-    ;;
-
-  *)
-    warn "Unable to identify Intel or AMD CPU."
-    warn "CPU microcode will not be installed automatically."
-    ;;
-  esac
-
-  if [[ -n "$MICROCODE_PACKAGE" ]]; then
-
-    log "CPU detected: $CPU_VENDOR"
-    log "Microcode package: $MICROCODE_PACKAGE"
-
-  fi
-
-  # ============================================================
-  # 12. INSTALL BASE SYSTEM
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Installing Arch Linux"
-  echo "============================================================"
-  echo
-
-  PACKAGES=(
-    base
-    base-devel
-    linux
-    linux-headers
-    linux-firmware
-
-    btrfs-progs
-    cryptsetup
-
-    grub
-    efibootmgr
-    os-prober
-    fuse3
-    ntfs-3g
-
-    networkmanager
-    iwd
-
-    sudo
-
-    vim
-    neovim
-
-    fish
-    fastfetch
-
-    man-db
-    man-pages
-  )
-
-  if [[ -n "$MICROCODE_PACKAGE" ]]; then
-    PACKAGES+=("$MICROCODE_PACKAGE")
-  fi
-
-  log "Installing packages..."
-
-  pacstrap \
-    -K \
-    /mnt \
-    "${PACKAGES[@]}"
-
-  # ============================================================
-  # 13. FSTAB
-  # ============================================================
-
-  echo
-  log "Generating fstab..."
-
-  genfstab -U /mnt >/mnt/etc/fstab
-
-  # Ensure swapfile entry exists.
-
-  if ((SWAP_SIZE > 0)); then
-
-    if ! grep -q '/swap/swapfile' /mnt/etc/fstab; then
-
-      echo \
-        "/swap/swapfile none swap defaults 0 0" \
-        >>/mnt/etc/fstab
-
-    fi
-
-  fi
-
-  echo
-  cat /mnt/etc/fstab
-  echo
-
-  # ============================================================
-  # 14. OPTIONAL WINDOWS ESP
-  # ============================================================
-
-  WINDOWS_EFI_PART=""
-
-  echo
-  echo "============================================================"
-  echo " Windows dual boot"
-  echo "============================================================"
-  echo
-
-  if [[ -f /mnt/boot/EFI/Microsoft/Boot/bootmgfw.efi ]]; then
-
-    log "Windows Boot Manager found on the selected EFI partition."
-
-  else
-
-    info "Windows Boot Manager was not found on the selected EFI partition."
-
-    echo
-    echo "If Windows uses a different EFI System Partition, it can be"
-    echo "temporarily mounted so os-prober can detect Windows."
-    echo
-
-    if confirm "Mount a separate Windows EFI partition?"; then
-
-      echo
-      lsblk -f
-      echo
-
-      read -rp \
-        "Enter Windows EFI partition: " \
-        WINDOWS_EFI_PART
-
-      [[ -b "$WINDOWS_EFI_PART" ]] ||
-        die "Invalid Windows EFI partition."
-
-      [[ "$WINDOWS_EFI_PART" != "$ROOT_PART" ]] ||
-        die "Windows EFI partition cannot be the Arch ROOT partition."
-
-      mkdir -p /mnt/windows-efi
-
-      mount \
-        -o ro \
-        "$WINDOWS_EFI_PART" \
-        /mnt/windows-efi
-
-    fi
-
-  fi
-
-  # ============================================================
-  # 15. USER CONFIGURATION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " System configuration"
-  echo "============================================================"
-  echo
-
-  # ------------------------------------------------------------
-  # Hostname
-  # ------------------------------------------------------------
-
-  read -rp "Hostname [archlinux]: " HOSTNAME
-
-  HOSTNAME=${HOSTNAME:-archlinux}
-
-  [[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] ||
-    die "Invalid hostname."
-
-  # ------------------------------------------------------------
-  # Timezone
-  # ------------------------------------------------------------
-
-  read -rp "Timezone [Asia/Singapore]: " TIMEZONE
-
-  TIMEZONE=${TIMEZONE:-Asia/Singapore}
-
-  [[ -e "/mnt/usr/share/zoneinfo/$TIMEZONE" ]] ||
-    die "Invalid timezone: $TIMEZONE"
-
-  # ------------------------------------------------------------
-  # User
-  # ------------------------------------------------------------
-
-  echo
-
-  CREATE_USER="yes"
-
-  if ! confirm "Create a regular user?"; then
-    CREATE_USER="no"
-  fi
-
-  USERNAME=""
-
-  if [[ "$CREATE_USER" == "yes" ]]; then
-
-    echo
-
-    read -rp "Username: " USERNAME
-
-    [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
-      die "Invalid username."
-
-  fi
-
-  # ============================================================
-  # 16. LUKS UUID
-  # ============================================================
-
-  LUKS_UUID=$(cryptsetup luksUUID "$ROOT_PART")
-
-  [[ "$LUKS_UUID" =~ ^[0-9a-fA-F-]+$ ]] ||
-    die "Unable to obtain the LUKS UUID."
-
-  log "LUKS UUID: $LUKS_UUID"
-
-  # ============================================================
-  # 17. WRITE INSTALL CONFIG
-  # ============================================================
-
-  CONFIG_FILE="/mnt/root/arch-install.conf"
-
-  {
-    printf 'HOSTNAME=%q\n' "$HOSTNAME"
+fi
+
+# ============================================================
+# 12. SYSTEM SETTINGS
+# ============================================================
+printf '\n=== System configuration ===\n\n'
+read_text 'Hostname' 'archlinux'
+HOSTNAME_VALUE="$REPLY_VALUE"
+[[ "$HOSTNAME_VALUE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || die 'Invalid hostname.'
+
+read_text 'Timezone' 'Asia/Singapore'
+TIMEZONE="$REPLY_VALUE"
+[[ -e "/mnt/usr/share/zoneinfo/$TIMEZONE" ]] || die "Invalid timezone: $TIMEZONE"
+
+CREATE_USER=no
+USERNAME=''
+if confirm 'Create a regular user?'; then
+    CREATE_USER=yes
+    read_text 'Username'
+    USERNAME="$REPLY_VALUE"
+    [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid username.'
+fi
+
+LUKS_UUID="$(cryptsetup luksUUID "$ROOT_PART")"
+[[ "$LUKS_UUID" =~ ^[0-9A-Fa-f-]+$ ]] || die 'Could not obtain the LUKS UUID.'
+log "LUKS UUID: $LUKS_UUID"
+
+# ============================================================
+# 13. PASS CONFIG TO CHROOT
+# ============================================================
+CONFIG_FILE=/mnt/root/arch-install.conf
+{
+    printf 'HOSTNAME_VALUE=%q\n' "$HOSTNAME_VALUE"
     printf 'TIMEZONE=%q\n' "$TIMEZONE"
     printf 'LUKS_UUID=%q\n' "$LUKS_UUID"
     printf 'HIBERNATION=%q\n' "$HIBERNATION"
     printf 'SWAP_OFFSET=%q\n' "$SWAP_OFFSET"
     printf 'CREATE_USER=%q\n' "$CREATE_USER"
     printf 'USERNAME=%q\n' "$USERNAME"
+} > "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 
-  } >"$CONFIG_FILE"
-
-  chmod 600 "$CONFIG_FILE"
-
-  # ============================================================
-  # 18. POST-INSTALL SCRIPT
-  # ============================================================
-
-  POSTINSTALL="/mnt/root/arch-postinstall.sh"
-
-  cat >"$POSTINSTALL" <<'CHROOT_SCRIPT'
+# ============================================================
+# 14. NON-INTERACTIVE CHROOT CONFIGURATION SCRIPT
+# ============================================================
+POSTINSTALL=/mnt/root/arch-postinstall.sh
+cat > "$POSTINSTALL" <<'CHROOT_SCRIPT'
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
-
 source /root/arch-install.conf
 
+log() { printf '[+] %s\n' "$*"; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-log() {
-    echo "[+] $*"
-}
-
-
-die() {
-    echo "[ERROR] $*" >&2
-    exit 1
-}
-
-
-# ============================================================
-# TIMEZONE
-# ============================================================
-
-log "Configuring timezone..."
-
-ln -sf \
-    "/usr/share/zoneinfo/$TIMEZONE" \
-    /etc/localtime
-
-
+log 'Configuring timezone...'
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 hwclock --systohc
 
-
-# ============================================================
-# LOCALE
-# ============================================================
-
-log "Configuring locale..."
-
-
+log 'Configuring locale...'
 sed -i \
     -e 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
     -e 's/^#zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' \
     /etc/locale.gen
-
-
 locale-gen
+printf 'LANG=en_US.UTF-8\n' > /etc/locale.conf
+printf 'KEYMAP=us\n' > /etc/vconsole.conf
 
-
-echo 'LANG=en_US.UTF-8' > /etc/locale.conf
-
-
-# Keep early-boot keyboard predictable for LUKS password entry.
-
-echo 'KEYMAP=us' > /etc/vconsole.conf
-
-
-# ============================================================
-# HOSTNAME
-# ============================================================
-
-log "Configuring hostname..."
-
-
-echo "$HOSTNAME" > /etc/hostname
-
-
+log 'Configuring hostname...'
+printf '%s\n' "$HOSTNAME_VALUE" > /etc/hostname
 cat > /etc/hosts <<EOF
 127.0.0.1 localhost
 ::1       localhost
-127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+127.0.1.1 ${HOSTNAME_VALUE}.localdomain ${HOSTNAME_VALUE}
 EOF
 
-
-# ============================================================
-# MKINITCPIO
-# ============================================================
-
-log "Configuring systemd-based initramfs with sd-encrypt..."
-
-
-cp \
-    /etc/mkinitcpio.conf \
-    /etc/mkinitcpio.conf.arch-installer-backup
-
-
-sed -i \
-    's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' \
-    /etc/mkinitcpio.conf
-
-
-# ============================================================
-# GRUB KERNEL PARAMETERS
-# ============================================================
-
-log "Configuring GRUB kernel parameters..."
-
+log 'Configuring mkinitcpio...'
+cp -f /etc/mkinitcpio.conf /etc/mkinitcpio.conf.arch-installer-backup
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
 
 GRUB_PARAMS="rd.luks.name=${LUKS_UUID}=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw loglevel=5 nowatchdog"
-
-
-if [[ "$HIBERNATION" == "yes" ]]; then
-
-    [[ "$SWAP_OFFSET" =~ ^[0-9]+$ ]] || \
-        die "Invalid swap resume offset."
-
+if [[ "$HIBERNATION" == yes ]]; then
+    [[ "$SWAP_OFFSET" =~ ^[0-9]+$ ]] || die 'Invalid swap resume offset.'
     GRUB_PARAMS+=" resume=/dev/mapper/cryptroot resume_offset=${SWAP_OFFSET}"
-
 fi
 
-
-cp \
-    /etc/default/grub \
-    /etc/default/grub.arch-installer-backup
-
-
+log 'Configuring GRUB...'
+cp -f /etc/default/grub /etc/default/grub.arch-installer-backup
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
-
-    sed -i \
-        "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_PARAMS}\"|" \
-        /etc/default/grub
-
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_PARAMS}\"|" /etc/default/grub
 else
-
-    echo \
-        "GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_PARAMS}\"" \
-        >> /etc/default/grub
-
+    printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$GRUB_PARAMS" >> /etc/default/grub
 fi
-
-
-# ------------------------------------------------------------
-# Saved default entry
-# ------------------------------------------------------------
 
 if grep -q '^#\?GRUB_DEFAULT=' /etc/default/grub; then
-
-    sed -i \
-        's/^#\?GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' \
-        /etc/default/grub
-
+    sed -i 's/^#\?GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
 else
-
-    echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
-
+    printf 'GRUB_DEFAULT=saved\n' >> /etc/default/grub
 fi
-
 
 if grep -q '^#\?GRUB_SAVEDEFAULT=' /etc/default/grub; then
-
-    sed -i \
-        's/^#\?GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' \
-        /etc/default/grub
-
+    sed -i 's/^#\?GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=true/' /etc/default/grub
 else
-
-    echo 'GRUB_SAVEDEFAULT=true' >> /etc/default/grub
-
+    printf 'GRUB_SAVEDEFAULT=true\n' >> /etc/default/grub
 fi
-
-
-# ------------------------------------------------------------
-# Enable os-prober
-# ------------------------------------------------------------
 
 if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
-
-    sed -i \
-        's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' \
-        /etc/default/grub
-
+    sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 else
-
-    echo \
-        'GRUB_DISABLE_OS_PROBER=false' \
-        >> /etc/default/grub
-
+    printf 'GRUB_DISABLE_OS_PROBER=false\n' >> /etc/default/grub
 fi
 
-
-# NOTE:
-#
-# GRUB_ENABLE_CRYPTODISK is intentionally NOT enabled.
-#
-# /boot is the unencrypted EFI System Partition.
-# GRUB reads the kernel and initramfs directly from /boot.
-#
-# sd-encrypt inside the initramfs unlocks the encrypted root
-# filesystem afterwards.
-
-
-# ============================================================
-# INITRAMFS
-# ============================================================
-
-log "Generating initramfs..."
-
+# /boot is the unencrypted ESP, so GRUB_ENABLE_CRYPTODISK is not needed.
+log 'Generating initramfs...'
 mkinitcpio -P
 
+log 'Installing GRUB UEFI bootloader...'
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=ARCH --recheck
 
-# ============================================================
-# INSTALL GRUB
-# ============================================================
-
-log "Installing GRUB UEFI bootloader..."
-
-
-grub-install \
-    --target=x86_64-efi \
-    --efi-directory=/boot \
-    --bootloader-id=ARCH \
-    --recheck
-
-
-# ============================================================
-# WINDOWS DETECTION
-# ============================================================
-
-log "Running os-prober..."
-
-
+log 'Running os-prober...'
 os-prober || true
 
+log 'Generating GRUB configuration...'
+grub-mkconfig -o /boot/grub/grub.cfg
 
-# ============================================================
-# GRUB CONFIG
-# ============================================================
-
-log "Generating GRUB configuration..."
-
-
-grub-mkconfig \
-    -o /boot/grub/grub.cfg
-
-
-# ============================================================
-# NETWORKMANAGER
-# ============================================================
-
-log "Enabling NetworkManager..."
-
-
+log 'Enabling NetworkManager...'
 systemctl enable NetworkManager
 
-
-# ============================================================
-# ROOT PASSWORD
-# ============================================================
-
-echo
-echo "============================================================"
-echo " Set the root password"
-echo "============================================================"
-echo
-
-
+printf '\n============================================================\n'
+printf 'Set the root password\n'
+printf '============================================================\n\n'
 passwd root
 
-
-# ============================================================
-# REGULAR USER
-# ============================================================
-
-if [[ "$CREATE_USER" == "yes" ]]; then
-
-    echo
+if [[ "$CREATE_USER" == yes ]]; then
     log "Creating user: $USERNAME"
-
-
-    useradd \
-        -m \
-        -G wheel \
-        -s /bin/bash \
-        "$USERNAME"
-
-
-    echo
-    echo "Set the password for $USERNAME:"
-    echo
-
-
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    printf '\nSet the password for %s:\n\n' "$USERNAME"
     passwd "$USERNAME"
-
-
-    cat > /etc/sudoers.d/10-wheel <<'EOF'
-%wheel ALL=(ALL:ALL) ALL
-EOF
-
-
+    printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-wheel
     chmod 440 /etc/sudoers.d/10-wheel
-
-
     visudo -cf /etc/sudoers.d/10-wheel
-
 fi
 
-
-# ============================================================
-# FINISHED
-# ============================================================
-
-echo
-echo "[+] Chroot configuration completed successfully."
-
+log 'Installed-system configuration completed.'
 CHROOT_SCRIPT
+chmod 700 "$POSTINSTALL"
 
-  chmod 700 "$POSTINSTALL"
+# Validate before executing it.
+bash -n "$POSTINSTALL"
 
-  # ============================================================
-  # 19. VALIDATE GENERATED SCRIPT
-  # ============================================================
+printf '\n=== Configuring installed system ===\n\n'
+# This executes a non-interactive script inside the new root. It does not open
+# an interactive nested shell.
+arch-chroot /mnt /root/arch-postinstall.sh
 
-  log "Validating generated post-install script..."
+rm -f "$POSTINSTALL" "$CONFIG_FILE"
 
-  bash -n "$POSTINSTALL"
+# ============================================================
+# 15. VERIFY
+# ============================================================
+printf '\n=== Installation verification ===\n\n'
+[[ -f /mnt/boot/grub/grub.cfg ]] || die 'GRUB configuration is missing.'
+[[ -d /mnt/boot/EFI/ARCH ]] || die 'GRUB EFI files are missing.'
+[[ -f /mnt/etc/fstab ]] || die 'fstab is missing.'
+grep -q "rd.luks.name=${LUKS_UUID}=cryptroot" /mnt/etc/default/grub || die 'LUKS kernel parameter is missing.'
+if [[ "$HIBERNATION" == yes ]]; then
+    grep -q "resume_offset=${SWAP_OFFSET}" /mnt/etc/default/grub || die 'Hibernation resume offset is missing.'
+fi
+log 'Verification passed.'
 
-  # ============================================================
-  # 20. CHROOT
-  # ============================================================
+sync
 
-  echo
-  echo "============================================================"
-  echo " Configuring installed system"
-  echo "============================================================"
-  echo
+printf '\n============================================================\n'
+printf 'Arch Linux installation completed successfully\n'
+printf '============================================================\n\n'
+printf 'Root partition : %s\n' "$ROOT_PART"
+printf 'EFI partition  : %s\n' "$EFI_PART"
+printf 'LUKS UUID      : %s\n' "$LUKS_UUID"
+printf 'Hostname       : %s\n' "$HOSTNAME_VALUE"
+printf 'Timezone       : %s\n' "$TIMEZONE"
+printf 'Swap           : %s GiB\n' "$SWAP_SIZE"
+printf 'Hibernation    : %s\n' "$HIBERNATION"
+[[ "$HIBERNATION" == yes ]] && printf 'Resume offset   : %s\n' "$SWAP_OFFSET"
 
-  arch-chroot \
-    /mnt \
-    /root/arch-postinstall.sh
+printf '\nUseful checks before reboot:\n\n'
+printf '  cat /mnt/etc/fstab\n'
+printf '  cat /mnt/etc/default/grub\n'
+printf '  cat /mnt/etc/mkinitcpio.conf\n'
+printf '  findmnt /mnt\n'
+printf '  lsblk -f\n\n'
 
-  # ============================================================
-  # 21. REMOVE TEMPORARY FILES
-  # ============================================================
-
-  rm -f \
-    /mnt/root/arch-postinstall.sh \
-    /mnt/root/arch-install.conf
-
-  # ============================================================
-  # 22. VERIFY INSTALLATION
-  # ============================================================
-
-  echo
-  echo "============================================================"
-  echo " Installation verification"
-  echo "============================================================"
-  echo
-
-  [[ -f /mnt/boot/grub/grub.cfg ]] ||
-    die "GRUB configuration file is missing."
-
-  [[ -d /mnt/boot/EFI/ARCH ]] ||
-    die "GRUB EFI files were not found."
-
-  [[ -f /mnt/etc/fstab ]] ||
-    die "fstab is missing."
-
-  grep -q \
-    "rd.luks.name=${LUKS_UUID}=cryptroot" \
-    /mnt/etc/default/grub ||
-    die "LUKS kernel parameter is missing from GRUB configuration."
-
-  log "GRUB configuration exists."
-  log "EFI bootloader exists."
-  log "fstab exists."
-  log "LUKS boot parameters are configured."
-
-  if [[ "$HIBERNATION" == "yes" ]]; then
-
-    grep -q \
-      "resume_offset=${SWAP_OFFSET}" \
-      /mnt/etc/default/grub ||
-      die "Hibernation resume offset is missing."
-
-    log "Hibernation resume offset configured."
-
-  fi
-
-  # ============================================================
-  # 23. SUMMARY
-  # ============================================================
-
-  sync
-
-  echo
-  echo "============================================================"
-  echo "        Arch Linux installation completed successfully"
-  echo "============================================================"
-  echo
-  echo "Root partition:"
-  echo
-  echo "  $ROOT_PART"
-  echo
-  echo "EFI partition:"
-  echo
-  echo "  $EFI_PART"
-  echo
-  echo "LUKS UUID:"
-  echo
-  echo "  $LUKS_UUID"
-  echo
-  echo "Hostname:"
-  echo
-  echo "  $HOSTNAME"
-  echo
-  echo "Timezone:"
-  echo
-  echo "  $TIMEZONE"
-  echo
-  echo "Btrfs:"
-  echo
-  echo "  @      -> /"
-  echo "  @home  -> /home"
-  echo "  @swap  -> /swap"
-  echo
-
-  if ((SWAP_SIZE > 0)); then
-
-    echo "Swap:"
-    echo
-    echo "  ${SWAP_SIZE} GiB"
-    echo
-
-  fi
-
-  if [[ "$HIBERNATION" == "yes" ]]; then
-
-    echo "Hibernation:"
-    echo
-    echo "  Enabled"
-    echo
-    echo "Resume offset:"
-    echo
-    echo "  $SWAP_OFFSET"
-    echo
-
-  else
-
-    echo "Hibernation:"
-    echo
-    echo "  Disabled"
-    echo
-
-  fi
-
-  echo "Before rebooting, you may inspect:"
-  echo
-  echo "  cat /mnt/etc/fstab"
-  echo
-  echo "  cat /mnt/etc/default/grub"
-  echo
-  echo "  cat /mnt/etc/mkinitcpio.conf"
-  echo
-  echo "  ls -R /mnt/boot/EFI"
-  echo
-  echo "  findmnt /mnt"
-  echo
-  echo "  lsblk -f"
-  echo
-
-  # ============================================================
-  # 24. OPTIONAL REBOOT
-  # ============================================================
-
-  if confirm "Unmount everything and reboot now?"; then
-
-    echo
-
-    if ((SWAP_SIZE > 0)); then
-
-      log "Disabling swap..."
-
-      swapoff /mnt/swap/swapfile || true
-
+if confirm 'Unmount everything and reboot now?'; then
+    if (( SWAP_SIZE > 0 )); then
+        swapoff /mnt/swap/swapfile || true
     fi
-
-    log "Unmounting filesystems..."
-
     umount -R /mnt
-
-    log "Closing LUKS container..."
-
     cryptsetup close cryptroot
-
-    log "Installation complete."
-
-    echo
-    echo "Remove the Arch installation media when the system restarts."
-    echo
-
+    log 'Remove the Arch installation media when the machine restarts.'
     reboot
-
-  else
-
-    echo
-    info "The system remains mounted at /mnt."
-    echo
-    echo "When ready to reboot manually:"
-    echo
-
-    if ((SWAP_SIZE > 0)); then
-      echo "  swapoff /mnt/swap/swapfile"
+else
+    printf '\nManual cleanup/reboot commands:\n\n'
+    if (( SWAP_SIZE > 0 )); then
+        printf '  swapoff /mnt/swap/swapfile\n'
     fi
-
-    echo "  umount -R /mnt"
-    echo "  cryptsetup close cryptroot"
-    echo "  reboot"
-    echo
-
-  fi
-)$()
+    printf '  umount -R /mnt\n'
+    printf '  cryptsetup close cryptroot\n'
+    printf '  reboot\n\n'
+fi
