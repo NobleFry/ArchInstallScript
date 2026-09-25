@@ -1,4 +1,4 @@
-# 个人用的arch linux 安装脚本和环境配置md
+# 个人用的 arch linux 安装脚本和环境配置md
 
 原博客：  
 [arch简明指南](https://arch.icekylin.online/)  
