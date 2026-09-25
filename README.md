@@ -4,7 +4,7 @@
 [arch简明指南](https://arch.icekylin.online/)  
 [Shorin-ArchLinux-Guide](https://github.com/SHORiN-KiWATA/Shorin-ArchLinux-Guide/tree/main)  
 [winapps-org/winapps](https://github.com/winapps-org/winapps/blob/main/docs/libvirt.md)  
-[告别重启：Linux 下的 NVIDIA 显卡直通](https://blog.vconet.top/archives/nvidia-kvm-passthrough/)
+[告别重启：Linux 下的 NVIDIA 显卡直通](https://blog.vconet.top/archives/nvidia-kvm-passthrough/)  
 自己加入了全盘加密与休眠  
 最基础的系统与kde安装  
 
