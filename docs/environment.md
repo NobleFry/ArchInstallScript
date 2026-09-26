@@ -4,7 +4,7 @@
 
 ## 1 安装显卡驱动
 
->所有 AMD 显卡建议使用开源驱动，英伟达显卡建议使用闭源驱动
+> 所有 AMD 显卡建议使用开源驱动，英伟达显卡建议使用闭源驱动
 
 ### Intel 核芯显卡
 
@@ -20,7 +20,7 @@ sudo pacman -S nvidia-dkms nvidia-settings lib32-nvidia-utils # 必须安装
 
 ### AMD 显卡
 
-本人无amd显卡暂不囊括
+本人无amd显卡暂不囊括。
 
 ## 2 使用dankinstall安装niri和dms
 

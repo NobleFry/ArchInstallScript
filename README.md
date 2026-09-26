@@ -1,12 +1,13 @@
 # 个人用的 arch linux 安装脚本和环境配置md
 
-原博客：
-[arch简明指南](https://arch.icekylin.online/)
-[Shorin-ArchLinux-Guide](https://github.com/SHORiN-KiWATA/Shorin-ArchLinux-Guide/tree/main)
-[winapps-org/winapps](https://github.com/winapps-org/winapps/blob/main/docs/libvirt.md)
-[告别重启：Linux 下的 NVIDIA 显卡直通](https://blog.vconet.top/archives/nvidia-kvm-passthrough/)
-自己加入了全盘加密与休眠
-最基础的系统与kde安装
+## 参考来源
+
+- [arch简明指南](https://arch.icekylin.online/)
+- [Shorin-ArchLinux-Guide](https://github.com/SHORiN-KiWATA/Shorin-ArchLinux-Guide/tree/main)
+- [winapps-org/winapps](https://github.com/winapps-org/winapps/blob/main/docs/libvirt.md)
+- [告别重启：Linux 下的 NVIDIA 显卡直通](https://blog.vconet.top/archives/nvidia-kvm-passthrough/)
+
+在参考基础上自己加入了全盘加密与休眠，以及最基础的系统与 kde 安装。
 
 ## 目录结构
 
@@ -38,3 +39,13 @@ MyArchGuide/
 3. 按 [docs/environment.md](docs/environment.md) 配置显卡驱动、shell 与应用。
 4. 需要跑 Windows 虚拟机或做独显直通，参考 [docs/virtualization.md](docs/virtualization.md)。
 5. 休眠有问题时用 [scripts/check.sh](scripts/check.sh) 对照排查。
+
+## 文档格式检查
+
+统一用 markdownlint 校验所有 md 的格式，规则见 [.markdownlint-cli2.jsonc](.markdownlint-cli2.jsonc)（无需本地安装依赖）：
+
+```bash
+npx --yes -p markdownlint-cli2 markdownlint-cli2 "**/*.md"
+```
+
+已关闭的规则只有两条会改变正文内容的：`MD013`（中文长行不强制折行）、`MD036`（保留 `**加粗小标题**` 写法，不升级为 ATX 标题）。

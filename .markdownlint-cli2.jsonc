@@ -1,0 +1,70 @@
+{
+  // markdownlint-cli2 配置：统一本仓库所有 md 的格式
+  //
+  // 校验命令（无需本地安装依赖）：
+  //   npx --yes -p markdownlint-cli2 markdownlint-cli2 "**/*.md"
+  //
+  // 规则放在 config 里，markdownlint-cli2 才会读取。
+
+  "config": {
+    // 中文按字符计数会把长句误报为超长行，交给编辑器软换行处理
+    "MD013": false,
+    // $$ 公式等内联 HTML 由 markdownlint-disable 注释按处豁免（见 docs/virtualization.md）
+    "MD033": true,
+    // 保留原作者的加粗小标题（如 **启用IOMMU**），不强制升级为 ATX 标题
+    "MD036": false,
+
+    // 列表标记统一为 -
+    "MD004": { "style": "dash" },
+    // 有序列表统一 1. 2. 3. 递增编号
+    "MD029": { "style": "ordered" },
+    // 代码块必须标注语言
+    "MD040": true,
+    // 标题前后各一个空行
+    "MD022": { "lines_above": 1, "lines_below": 1 },
+    // 列表前后需要空行
+    "MD032": true,
+    // 引用块 > 后需要空格
+    "MD018": true,
+    // ATX 标题 # 后需要空格、不允许结尾多余 #
+    "MD019": true,
+    "MD020": true,
+    "MD021": true,
+    // 禁止重复空行、行首多余空格、行尾空格
+    "MD012": true,
+    "MD023": true,
+    "MD027": true,
+    "MD009": true,
+    // 强调符号内侧不留空格：**x** 而非 ** x **
+    "MD037": true,
+    "MD038": true,
+    "MD039": true,
+    // 裸 URL 需要写成链接或自动链接
+    "MD034": true,
+    // 文件以单个换行结尾，且只有一个 H1
+    "MD047": true,
+    "MD025": { "front_matter_title": "" },
+    // 同文档内锚点链接必须能解析到真实标题
+    "MD051": true,
+    // 标题/列表/表格风格统一
+    "MD001": true,
+    "MD003": { "style": "atx" },
+    "MD005": true,
+    "MD026": true,
+    "MD035": true,
+    "MD042": true,
+    "MD044": { "urls": false },
+    "MD045": true,
+    "MD046": { "style": "fenced" },
+    "MD048": true,
+    "MD049": { "style": "asterisk" },
+    "MD050": { "style": "asterisk" },
+    "MD052": true,
+    "MD053": true,
+    "MD054": true,
+    "MD055": { "style": "leading_and_trailing" },
+    "MD056": true,
+    "MD057": true,
+    "MD058": true
+  }
+}
