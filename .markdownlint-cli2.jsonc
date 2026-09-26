@@ -6,12 +6,19 @@
   //
   // 规则放在 config 里，markdownlint-cli2 才会读取。
 
+  // 只校验入库的文档，跳过 .qwen 下的临时文件与依赖目录
+  "ignores": [
+    ".qwen",
+    "node_modules"
+  ],
+
   "config": {
     // 中文按字符计数会把长句误报为超长行，交给编辑器软换行处理
     "MD013": false,
-    // $$ 公式等内联 HTML 由 markdownlint-disable 注释按处豁免（见 docs/virtualization.md）
+    // $$ 公式不是 HTML，无需豁免；保留此规则以拦截真正的内联 HTML
     "MD033": true,
-    // 保留原作者的加粗小标题（如 **启用IOMMU**），不强制升级为 ATX 标题
+    // 标题约定用带多级编号的 ATX（## 1 / ### 1.1 / #### 1.1.1），见 README「文档格式检查」。
+    // MD036 仍关闭，是为了容忍历史文档里残留的加粗小标题，不逼着批量改写正文。
     "MD036": false,
 
     // 列表标记统一为 -
